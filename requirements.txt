@@ -1,6 +1,6 @@
+playwright==1.40.0  # Add this line
 fastapi
 uvicorn
-beautifulsoup4
 requests
-selenium
+beautifulsoup4
 python-dateutil
