@@ -2,11 +2,12 @@ import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks # <--- AÑADIDO para tareas en segundo plano
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -15,82 +16,90 @@ import traceback
 import re
 from dateutil.parser import parse
 import uvicorn
+import os
 
 app = FastAPI()
 
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # Permite cualquier origen, considera restringirlo en producción
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Permite todos los métodos
+    allow_headers=["*"], # Permite todas las cabeceras
 )
 
-# --- Helper Functions (Combined and Deduplicated) ---
+# --- Helper Functions ---
 def init_driver():
-    """Initialize Playwright browser instead of Chrome WebDriver"""
-    from playwright.sync_api import sync_playwright
+    """Initialize Chrome WebDriver in headless mode with improved error handling"""
+    chrome_options = Options()
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920x1080')
+    chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
+    # Optimización opcional: Deshabilitar imágenes si no son necesarias para el scraping
+    # chrome_options.add_argument('--blink-settings=imagesEnabled=false')
+
+    chrome_binary_path = os.environ.get("GOOGLE_CHROME_BIN")
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH")
+
+    if chrome_binary_path:
+        chrome_options.binary_location = chrome_binary_path
+        print(f"Usando Chrome binary de: {chrome_binary_path}")
+    else:
+        print("ADVERTENCIA: GOOGLE_CHROME_BIN no está configurado. Selenium intentará usar la ubicación por defecto de Chrome.")
+
     try:
-        playwright = sync_playwright().start()
-        browser = playwright.chromium.launch(
-            headless=True,
-            args=[
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-gpu',
-                '--window-size=1920,1080'
-            ]
-        )
-        context = browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        )
-        page = context.new_page()
-        return page, browser, playwright
+        if chromedriver_path:
+            print(f"Usando ChromeDriver de: {chromedriver_path}")
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+        else:
+            print("ADVERTENCIA: CHROMEDRIVER_PATH no está configurado. Selenium intentará encontrar ChromeDriver en el PATH del sistema.")
+            driver = webdriver.Chrome(options=chrome_options) # Requiere chromedriver en el PATH
+        
+        print("WebDriver inicializado correctamente.")
+        return driver
     except Exception as e:
-        print(f"Error initializing Playwright browser: {str(e)}")
+        print(f"Error FATAL al inicializar ChromeDriver: {str(e)}")
         print(traceback.format_exc())
-        return None, None, None
+        # Proveer más detalles sobre errores comunes de inicialización
+        if "cannot find chrome binary" in str(e).lower():
+            print("Detalle del error: No se encuentra el binario de Chrome. Verifica la variable GOOGLE_CHROME_BIN o la instalación de Chrome.")
+        elif "executable needs to be in PATH" in str(e).lower():
+            print("Detalle del error: ChromeDriver no se encuentra en el PATH. Verifica la variable CHROMEDRIVER_PATH o la ubicación de chromedriver.")
+        elif "session not created" in str(e).lower():
+            print("Detalle del error: No se pudo crear la sesión. Puede ser por incompatibilidad de versiones Chrome/ChromeDriver o problemas de recursos.")
+        return None
 
 def clean_odd_value(odd_text):
-    """Clean and standardize odd values"""
     if not odd_text:
         return "N/A"
-    
     odd_text = odd_text.strip().replace('\xa0', ' ').replace('\u00a0', ' ')
-    
     match = re.search(r'(\d+\.?\d*)', odd_text)
-    if match:
-        return match.group(1)
-    
-    return odd_text
+    return match.group(1) if match else odd_text
 
-def parse_match_date_liga(date_str): # Renamed to avoid conflict, specific to La Liga scraper
-    """Parse match date into a datetime object for La Liga scraper"""
+def parse_match_date_liga(date_str):
     if not date_str:
         return "N/A"
-    
     try:
-        date_part = date_str.split('-')[0].strip()  # Remove time part
+        date_part = date_str.split('-')[0].strip()
         return parse(date_part, dayfirst=True).strftime('%Y-%m-%d %H:%M')
     except Exception as e:
         print(f"Error parsing date (liga): {date_str} - {str(e)}")
         return date_str
 
-def parse_match_date_transfermarkt_general(date_str): # Renamed, specific to general Transfermarkt odds
-    """Parse match date into a datetime object for general Transfermarkt odds"""
+def parse_match_date_transfermarkt_general(date_str):
     try:
-        # Get current date and year
-        today = datetime.now()
         return parse(date_str).strftime('%Y-%m-%d %H:%M')
     except Exception as e:
         print(f"Error parsing date (transfermarkt general): {date_str} - {str(e)}")
         return date_str
 
 def safe_get_text(element, default="N/A"):
-    """Safely get text from BeautifulSoup element"""
     if element is None:
         return default
     try:
@@ -99,7 +108,6 @@ def safe_get_text(element, default="N/A"):
         return default
 
 def parse_relevo_date(date_str):
-    """Parse Relevo's article date into a datetime object or return original."""
     if not date_str:
         return "N/A"
     try:
@@ -108,16 +116,15 @@ def parse_relevo_date(date_str):
         print(f"Error parsing date (relevo): {date_str} - {str(e)}")
         return date_str
 
-# --- Scraper 1: La Liga Odds (from script.txt source 1-27) ---
+# --- Scraper 1: La Liga Odds ---
 def scrape_liga_odds():
-    """Scraping function for La Liga odds page with Playwright"""
-    page, browser, playwright = init_driver()
-    if not page:
-        return {"error": "Failed to initialize browser"}
+    print("Iniciando scrape_liga_odds...")
+    driver = init_driver()
+    if not driver:
+        return {"error": "Failed to initialize browser", "details": "WebDriver could not start. Check logs for init_driver errors."}
     
     url = "https://www.transfermarkt.es/apuestas/la-liga/"
     print(f"Accediendo a Cuotas La Liga: {url}")
-    
     result = {
         "scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         "matches": [],
@@ -126,496 +133,474 @@ def scrape_liga_odds():
     }
     
     try:
-        page.goto(url)
-        try:
-            page.wait_for_selector(".oddscomp-widget-iframe-container", timeout=15000)
-            print("Cuotas La Liga: Contenido principal cargado")
-        except Exception as e:
-            print(f"Cuotas La Liga: Advertencia de carga de contenido: {str(e)}")
-        
-        page.wait_for_timeout(3000)
-        soup = BeautifulSoup(page.content(), 'html.parser')
+        driver.get(url)
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CLASS_NAME, "oddscomp-widget-iframe-container"))
+        )
+        print("Cuotas La Liga: Contenido principal cargado")
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
         
         combined_bet_section = soup.find('h2', string='Apuesta combinada de la jornada')
         if combined_bet_section:
-            combined_bet = {
-                "description": "",
-                "bets": []
-            }
+            combined_bet_data = {"description": "", "bets": []}
             desc_paragraphs = []
             next_elem = combined_bet_section.find_next_sibling('p')
             while next_elem and next_elem.name == 'p':
                 desc_paragraphs.append(safe_get_text(next_elem))
                 next_elem = next_elem.find_next_sibling()
-            combined_bet["description"] = " ".join(desc_paragraphs)
+            combined_bet_data["description"] = " ".join(desc_paragraphs)
             
-            bet_sections = combined_bet_section.find_all_next('p', string=lambda t: t and any(team in t for team in ['Girona', 'Atlético', 'Barcelona']))
-            for bet in bet_sections[:3]:
-                bet_text = safe_get_text(bet)
-                strong_tag = bet.find_next('strong')
-                odd_value = clean_odd_value(safe_get_text(strong_tag))
-                parts = bet_text.split(':')
-                match_part = parts[0].strip() if len(parts) > 0 else "N/A"
-                bet_part = parts[1].strip() if len(parts) > 1 else "N/A"
-                combined_bet["bets"].append({
-                    "match": match_part,
-                    "bet": bet_part,
-                    "odd": odd_value
-                })
-            result["combined_bet"] = combined_bet
-        
-        match_table = soup.find('figure', class_='wp-block-table')
-        if match_table:
-            table = match_table.find('table')
-            if table:
-                rows = table.find_all('tr')[1:]
-                for row in rows:
-                    try:
-                        cols = row.find_all('td')
-                        if len(cols) >= 4:
-                            prediction_text = safe_get_text(cols[3])
-                            prediction_parts = prediction_text.split('➡')
-                            match_data = {
-                                "teams": safe_get_text(cols[0]),
-                                "date": parse_match_date_liga(safe_get_text(cols[1])),
-                                "stadium": safe_get_text(cols[2]),
-                                "prediction": prediction_parts[0].strip() if prediction_parts else "N/A",
-                                "odd": clean_odd_value(prediction_parts[-1].strip() if prediction_parts else "N/A")
-                            }
-                            result["matches"].append(match_data)
-                    except Exception as e:
-                        print(f"Error procesando fila de partido de La Liga: {str(e)}")
-                        continue
-        
+            bet_container = combined_bet_section.find_parent()
+            if bet_container:
+                potential_bets_p = bet_container.find_all('p')
+                parsed_bets_count = 0
+                for p_tag in potential_bets_p:
+                    if parsed_bets_count >= 3: break
+                    p_text = safe_get_text(p_tag)
+                    if ':' in p_text and any(kw in p_text for kw in ['Girona', 'Atlético', 'Barcelona', 'Real Madrid', 'vs']):
+                        strong_tag = p_tag.find('strong') or p_tag.find_next('strong')
+                        odd_value = clean_odd_value(safe_get_text(strong_tag)) if strong_tag else "N/A"
+                        parts = p_text.split(':', 1)
+                        match_part = parts[0].strip()
+                        bet_part = parts[1].split(odd_value)[0].strip() if len(parts) > 1 and odd_value != "N/A" else (parts[1].strip() if len(parts) > 1 else "N/A")
+                        combined_bet_data["bets"].append({"match": match_part, "bet": bet_part, "odd": odd_value})
+                        parsed_bets_count += 1
+            result["combined_bet"] = combined_bet_data
+        else:
+            print("Cuotas La Liga: Sección 'Apuesta combinada de la jornada' no encontrada.")
+
+        match_table_figure = soup.find('figure', class_='wp-block-table')
+        if match_table_figure and (table := match_table_figure.find('table')):
+            for row in table.find_all('tr')[1:]:
+                try:
+                    cols = row.find_all('td')
+                    if len(cols) >= 4:
+                        prediction_text = safe_get_text(cols[3])
+                        prediction_parts = prediction_text.split('➡')
+                        match_data = {
+                            "teams": safe_get_text(cols[0]),
+                            "date": parse_match_date_liga(safe_get_text(cols[1])),
+                            "stadium": safe_get_text(cols[2]),
+                            "prediction": prediction_parts[0].strip() if prediction_parts else "N/A",
+                            "odd": clean_odd_value(prediction_parts[-1].strip()) if len(prediction_parts) > 1 else "N/A"
+                        }
+                        result["matches"].append(match_data)
+                except Exception as e_row:
+                    print(f"Error procesando fila de partido La Liga: {e_row}")
+        else:
+            print("Cuotas La Liga: Tabla de partidos no encontrada.")
+            
         title_section = soup.find(lambda tag: tag.name and "Favoritos para ganar la liga española" in tag.get_text())
-        if title_section:
-            title_table = title_section.find_next('figure', class_='wp-block-table')
-            if title_table:
-                table = title_table.find('table')
-                if table:
-                    headers = [safe_get_text(th) for th in table.find('thead').find_all('th')] if table.find('thead') else []
-                    rows = table.find_all('tr')[1:]
-                    for row in rows:
-                        cols = row.find_all('td')
-                        if len(cols) == len(headers):
-                            team_data = {"team": safe_get_text(cols[0])}
-                            for i in range(1, min(len(headers), len(cols))):
-                                team_data[headers[i]] = clean_odd_value(safe_get_text(cols[i]))
-                            result["title_odds"].append(team_data)
+        if title_section and (title_table_figure := title_section.find_next('figure', class_='wp-block-table')) and \
+           (table := title_table_figure.find('table')):
+            headers = [safe_get_text(th) for th in table.find('thead').find_all('th')] if table.find('thead') else []
+            tbody_rows = table.find('tbody').find_all('tr') if table.find('tbody') else table.find_all('tr')[1:]
+            for row in tbody_rows:
+                cols = row.find_all('td')
+                if cols:
+                    team_data = {"team": safe_get_text(cols[0])}
+                    for i, header in enumerate(headers[1:], 1): # Start from second header
+                        if i < len(cols):
+                            team_data[header] = clean_odd_value(safe_get_text(cols[i]))
+                        else: # Fallback if less cols than headers
+                            team_data[header] = "N/A"
+                    if not headers and len(cols) > 1: # No headers, generic bookmaker names
+                         for i in range(1, len(cols)):
+                            team_data[f"Bookmaker_{i}"] = clean_odd_value(safe_get_text(cols[i]))
+                    result["title_odds"].append(team_data)
+        else:
+            print("Cuotas La Liga: Sección/tabla de favoritos para ganar la liga no encontrada.")
             
     except Exception as e:
         print(f"Error durante el scraping de cuotas de La Liga: {str(e)}")
         print(traceback.format_exc())
-        try:
-            page.screenshot(path="error_screenshot_liga.png")
-            with open("error_page_source_liga.html", "w", encoding="utf-8") as f:
-                f.write(page.content())
-            print("Cuotas La Liga: Archivos de depuración guardados")
-        except:
-            pass
-        return {"error": str(e), "stack_trace": traceback.format_exc()}
+        result["error_scraping"] = f"Error during scraping process: {str(e)}"
     finally:
-        if page:
-            if browser:
-                browser.close()
-            if playwright:
-                playwright.stop()
-    
+        if driver:
+            driver.quit()
+            print("Cuotas La Liga: WebDriver cerrado.")
+    print(f"scrape_liga_odds finalizado. Partidos: {len(result.get('matches',[]))}, Cuotas Título: {len(result.get('title_odds',[]))}")
     return result
 
-# --- Scraper 2: Relevo News (from script.txt source 28-53) ---
+# --- Scraper 2: Relevo News ---
 def scrape_relevo_news():
-    """Scraping function for Relevo news page."""
+    print("Iniciando scrape_relevo_news...")
     driver = init_driver()
     if not driver:
-        return {"error": "Failed to initialize browser"}
+        return {"error": "Failed to initialize browser", "details": "WebDriver could not start."}
     
     url = "https://www.relevo.com/futbol/mercado-fichajes/"
     print(f"Accediendo a Noticias Relevo: {url}")
-    
-    result = {
-        "scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "articles": []
-    }
+    result = {"scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "articles": []}
     
     try:
         driver.get(url)
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.grid--AB-C article.article"))
-            )
-            print("Noticias Relevo: Contenido principal cargado")
-        except Exception as e:
-            print(f"Noticias Relevo: Advertencia de carga de contenido: {str(e)}")
-        
-        time.sleep(5)
+        WebDriverWait(driver, 25).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.grid--AB-C article.article"))
+        )
+        print("Noticias Relevo: Contenido principal cargado")
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         articles_html = soup.select("div.grid--AB-C div.grid__col article.article")
         
         if not articles_html:
-            print("Noticias Relevo: No se encontraron artículos. Revisa selectores o estructura de la página.")
+            print("Noticias Relevo: No se encontraron artículos.")
+            result["info"] = "No articles found on Relevo at this time."
+            return result
 
         for article_tag in articles_html:
             try:
-                title_tag = article_tag.find('h2', class_='article__title')
-                title = "N/A"
-                link = "N/A"
-                if title_tag and title_tag.find('a'):
-                    title_anchor = title_tag.find('a')
+                title, link = "N/A", "N/A"
+                if (title_anchor := (article_tag.find('h2', class_='article__title') or article_tag.find('h3', class_='article__title')) \
+                                  and (article_tag.find('h2', class_='article__title') or article_tag.find('h3', class_='article__title')).find('a')):
                     title = safe_get_text(title_anchor)
-                    link = title_anchor.get('href', "N/A")
-                    if link and not link.startswith('http'):
-                        link = "https://www.relevo.com" + link
+                    link_href = title_anchor.get('href', "N/A")
+                    link = "https://www.relevo.com" + link_href if link_href and not link_href.startswith('http') else link_href
 
                 authors_list = []
-                author_section = article_tag.find('div', class_='author--art')
-                if author_section:
-                    author_signature = author_section.find('p', class_='author__signature')
-                    if author_signature:
-                        author_tags = author_signature.find_all('a')
-                        for author_a in author_tags:
-                            authors_list.append({
-                                "name": safe_get_text(author_a),
-                                "profile_url": author_a.get('href', "N/A")
-                            })
-                        if not authors_list and not author_tags :
-                            authors_list.append({"name": safe_get_text(author_signature).split("Hace")[0].strip(), "profile_url": "N/A"})
-
-                publication_date_str = "N/A"
-                date_tag = None
-                if author_section :
-                    date_tag = author_section.find('time', class_='author__date')
+                if (author_section := article_tag.find('div', class_='author--art')):
+                    if (author_signature := author_section.find('p', class_='author__signature')):
+                        author_tags_a = author_signature.find_all('a')
+                        if author_tags_a:
+                            for author_a in author_tags_a:
+                                name = safe_get_text(author_a)
+                                url_ = author_a.get('href', "N/A")
+                                profile_url = "https://www.relevo.com" + url_ if url_ and not url_.startswith('http') else url_
+                                authors_list.append({"name": name, "profile_url": profile_url})
+                        else: # No <a> tags, try to get text
+                            author_name_candidate = safe_get_text(author_signature).split("Hace")[0].strip()
+                            if author_name_candidate: authors_list.append({"name": author_name_candidate, "profile_url": "N/A"})
+                    if not authors_list: # Fallback: find any author links in section
+                        for author_link_tag in author_section.find_all('a', href=re.compile(r'/autor/')):
+                            name = safe_get_text(author_link_tag)
+                            url_ = author_link_tag.get('href')
+                            profile_url = "https://www.relevo.com" + url_ if url_ and not url_.startswith('http') else url_
+                            authors_list.append({"name": name, "profile_url": profile_url})
                 
+                publication_date_str = "N/A"
+                date_tag = article_tag.find('time', class_='author__date') or article_tag.find('time')
                 if date_tag:
-                    if date_tag.has_attr('datetime'):
-                        publication_date_str = date_tag['datetime']
-                    else:
-                        publication_date_str = safe_get_text(date_tag)
+                    publication_date_str = date_tag.get('datetime', safe_get_text(date_tag))
                 publication_date = parse_relevo_date(publication_date_str)
 
                 image_url = "N/A"
-                img_container = article_tag.find('div', class_='article__container-img')
-                if img_container:
-                    img_tag = img_container.find('img')
-                    if img_tag:
-                        image_url = img_tag.get('src', "N/A")
+                if (img_container := article_tag.find('div', class_='article__container-img')) and \
+                   (img_tag := img_container.find('img')):
+                    image_url = img_tag.get('src', img_tag.get('data-src', "N/A"))
 
-                article_data = {
-                    "title": title,
-                    "link": link,
+                result["articles"].append({
+                    "title": title, "link": link,
                     "authors": authors_list if authors_list else [{"name": "N/A", "profile_url": "N/A"}],
                     "publication_date_iso": publication_date if publication_date != "N/A" else publication_date_str,
                     "image_url": image_url
-                }
-                result["articles"].append(article_data)
-            except Exception as e:
-                print(f"Error procesando un artículo de Relevo: {str(e)}")
-                print(traceback.format_exc())
-                continue
-            
+                })
+            except Exception as e_article:
+                print(f"Error procesando artículo de Relevo: {e_article}")
     except Exception as e:
-        print(f"Error durante el scraping de noticias de Relevo: {str(e)}")
+        print(f"Error durante el scraping de Relevo: {str(e)}")
         print(traceback.format_exc())
-        error_filename_detail = datetime.now().strftime('%Y%m%d_%H%M%S')
-        try:
-            driver.save_screenshot(f"error_screenshot_relevo_{error_filename_detail}.png")
-            with open(f"error_page_source_relevo_{error_filename_detail}.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
-            print("Noticias Relevo: Archivos de depuración guardados")
-        except Exception as e_debug:
-            print(f"Noticias Relevo: No se pudieron guardar los archivos de depuración: {e_debug}")
-        return {"error": str(e), "stack_trace": traceback.format_exc()}
+        result["error_scraping"] = f"Error during Relevo scraping: {str(e)}"
     finally:
         if driver:
             driver.quit()
-    
+            print("Noticias Relevo: WebDriver cerrado.")
+    print(f"scrape_relevo_news finalizado. Artículos: {len(result.get('articles',[]))}")
     return result
 
-# --- Scraper 3: TablesLeague Data (from script.txt source 54-79) ---
+# --- Scraper 3: TablesLeague Data ---
 def scrape_tablesleague_data():
-    """
-    Función principal para hacer scraping de las tablas de ligas de m.tablesleague.com
-    """
     url = "https://m.tablesleague.com/"
     print(f"Accediendo a TablesLeague: {url}")
-    
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    result = {
-        "scraped_at": current_time,
-        "leagues": []
-    }
-    
+    result = {"scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "leagues": []}
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=15)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=20)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        content_div = soup.find('div', class_='content')
-        if not content_div:
-            result["error"] = "No se encontró el contenedor principal 'div.content'. La estructura del sitio puede haber cambiado."
+        if not (content_div := soup.find('div', class_='content')):
+            result["error"] = "No se encontró 'div.content' en TablesLeague."
             return result
 
-        all_league_title_headers = []
-        for header_candidate in content_div.find_all('div', class_='header'):
-            if header_candidate.find('img', class_='flag'):
-                all_league_title_headers.append(header_candidate)
-        
-        print(f"TablesLeague DEBUG: Encontradas {len(all_league_title_headers)} cabeceras de título de liga.")
-        
-        if not all_league_title_headers:
-            result["error"] = "No se encontraron cabeceras de título de liga. No se pueden extraer tablas."
+        league_headers = [h for h in content_div.find_all('div', class_='header') if h.find('img', class_='flag')]
+        if not league_headers:
+            result["info"] = "No se encontraron cabeceras de liga con banderas en TablesLeague."
             return result
+
+        for league_header_tag in league_headers:
+            league_name = "Unknown League"
+            if (img_tag := league_header_tag.find('img', class_='flag')) and \
+               img_tag.next_sibling and isinstance(img_tag.next_sibling, str):
+                league_name = img_tag.next_sibling.strip()
+            elif (a_tag := league_header_tag.find('a')):
+                league_name = safe_get_text(a_tag)
+            else: # Fallback
+                full_header_text = league_header_tag.get_text(separator=" ", strip=True)
+                img_alt = img_tag.get('alt', '') if img_tag else ''
+                league_name = full_header_text.replace(img_alt, '').strip() or "League Name Not Found"
             
-        for index, league_header_tag in enumerate(all_league_title_headers):
-            league_data = {"name": "Unknown League", "teams": []}
-            try:
-                print(f"TablesLeague DEBUG: Procesando cabecera de liga #{index + 1}")
-                
-                league_name_text = "Unknown League"
-                img_tag = league_header_tag.find('img', class_='flag')
-                if img_tag and img_tag.next_sibling and isinstance(img_tag.next_sibling, str):
-                    league_name_text = img_tag.next_sibling.strip()
-                elif league_header_tag.contents:
-                    for content_item in reversed(league_header_tag.contents):
-                        if isinstance(content_item, str) and content_item.strip():
-                            league_name_text = content_item.strip()
-                            break
-                    if league_name_text == "Unknown League" and league_header_tag.string is None:
-                         league_name_text = league_header_tag.get_text(separator=" ", strip=True)
-                    elif league_header_tag.string:
-                        league_name_text = league_header_tag.string.strip()
-
-                if not league_name_text or league_name_text == "Unknown League":
-                    league_name_text = league_header_tag.get_text(separator=" ", strip=True).replace(img_tag.get('alt',''),'').strip() if img_tag else league_header_tag.get_text(separator=" ", strip=True)
-                league_data["name"] = league_name_text
-                print(f"TablesLeague DEBUG: Nombre de liga extraído: '{league_name_text}'")
-
-                table_div = league_header_tag.find_next_sibling('div', class_='table')
-                if not table_div:
-                    print(f"TablesLeague WARN: No se encontró 'div.table' después de la cabecera para la liga: '{league_name_text}'. Saltando.")
-                    continue
-                
-                rows = table_div.find_all('div', class_='row')
-                if not rows:
-                    print(f"TablesLeague WARN: No se encontraron filas (div.row) para la liga: '{league_name_text}'.")
-                    continue
-
-                column_headers = []
-                header_row_tag = table_div.find('div', class_='row headers')
-                if header_row_tag:
-                    header_cells = header_row_tag.find_all('div', class_='cell')
-                    column_headers = [cell.get_text(strip=True) for cell in header_cells]
-                
-                if not column_headers:
-                    print(f"TablesLeague WARN: No se encontraron encabezados de columna para la liga: '{league_name_text}'. Usando predeterminados.")
-                    column_headers = ["#", "Team", "M", "W", "D", "L", "G+", "G-", "GD", "PTS"]
-
-                for row_tag in rows:
-                    if 'headers' in row_tag.get('class', []):
-                        continue 
-                    
-                    cells = row_tag.find_all('div', class_='cell')
-                    team_stats = {}
-                    for i, cell_tag in enumerate(cells):
-                        header_name = column_headers[i] if i < len(column_headers) else f"column_{i+1}"
-                        team_stats[header_name] = cell_tag.get_text(strip=True)
-                    
-                    if team_stats and "#" in team_stats and team_stats["#"]:
-                         league_data["teams"].append(team_stats)
-                
-                if league_data["teams"]:
-                    result["leagues"].append(league_data)
-                else:
-                    print(f"TablesLeague INFO: No se extrajeron equipos para la liga '{league_name_text}'. No se añadirá.")
+            league_data = {"name": league_name, "teams": []}
+            if not (table_div := league_header_tag.find_next_sibling('div', class_='table')):
+                print(f"TablesLeague WARN: No 'div.table' para liga '{league_name}'.")
+                continue
             
-            except Exception as e_league:
-                print(f"TablesLeague ERROR al procesar la liga '{league_data.get('name', 'Desconocida')}' (índice {index}): {str(e_league)}")
-                print(traceback.format_exc())
-                continue 
-    
+            rows = table_div.find_all('div', class_='row')
+            if len(rows) <= 1: # Need more than just a header row potentially
+                print(f"TablesLeague WARN: No filas de datos para liga '{league_name}'.")
+                continue
+
+            column_map = {
+                "#": "Position", "POS": "Position", "TEAM": "Team", "CLUB": "Team",
+                "M": "Played", "P": "Played", "PJ": "Played", "PLD": "Played",
+                "W": "Won", "G": "Won", "PG": "Won", "D": "Drawn", "E": "Drawn", "PE": "Drawn",
+                "L": "Lost", "PP": "Lost", # 'P' is ambiguous, might conflict if also for Points
+                "G+": "GoalsFor", "GF": "GoalsFor", "F": "GoalsFor",
+                "G-": "GoalsAgainst", "GA": "GoalsAgainst", "A": "GoalsAgainst",
+                "GD": "GoalDifference", "DG": "GoalDifference", "DIF": "GoalDifference",
+                "PTS": "Points", "PUNTOS": "Points"
+            }
+            column_headers_tags = table_div.find('div', class_='row headers')
+            final_headers = [column_map.get(safe_get_text(cell).upper(), safe_get_text(cell)) 
+                             for cell in column_headers_tags.find_all('div', class_='cell')] if column_headers_tags else []
+
+            for row_tag in rows:
+                if 'headers' in row_tag.get('class', []): continue
+                cells = row_tag.find_all('div', class_='cell')
+                if not cells: continue
+                
+                team_stats = {}
+                for i, cell_tag in enumerate(cells):
+                    header_name = final_headers[i] if i < len(final_headers) and final_headers[i] else f"column_{i+1}"
+                    team_stats[header_name] = safe_get_text(cell_tag)
+                
+                if team_stats.get("Team"):
+                    league_data["teams"].append(team_stats)
+            
+            if league_data["teams"]: result["leagues"].append(league_data)
+        
     except requests.exceptions.RequestException as e_http:
-        print(f"Error durante la petición HTTP a TablesLeague {url}: {str(e_http)}")
-        result["error"] = f"Fallo en la petición HTTP: {str(e_http)}"
-        result["stack_trace"] = traceback.format_exc()
+        result["error"] = f"Fallo HTTP en TablesLeague: {e_http}"
     except Exception as e_general:
-        print(f"Error general durante el scraping de TablesLeague: {str(e_general)}")
-        result["error"] = f"Error inesperado durante el scraping de TablesLeague: {str(e_general)}"
-        result["stack_trace"] = traceback.format_exc()
+        result["error"] = f"Error inesperado en TablesLeague: {e_general}"
+        print(traceback.format_exc())
     
-    if not result["leagues"] and "error" not in result:
-        result["info"] = "El scraping de TablesLeague se completó, pero no se encontraron datos de ligas."
-
+    if not result["leagues"] and "error" not in result and "info" not in result:
+        result["info"] = "Scraping de TablesLeague completado, no se encontraron datos de ligas procesables."
+    print(f"scrape_tablesleague_data finalizado. Ligas: {len(result.get('leagues', []))}")
     return result
 
-# --- Scraper 4: Transfermarkt General Odds (from script.txt source 80-101) ---
+# --- Scraper 4: Transfermarkt General Odds ---
 def scrape_transfermarkt_general_odds():
-    """Main scraping function for Transfermarkt general odds"""
+    print("Iniciando scrape_transfermarkt_general_odds...")
     driver = init_driver()
     if not driver:
-        return {"error": "Failed to initialize browser"}
+        return {"error": "Failed to initialize browser", "details": "WebDriver could not start."}
     
     url = "https://www.transfermarkt.es/apuestas/cuotas/"
     print(f"Accediendo a Cuotas Generales Transfermarkt: {url}")
-    
-    result = {
-        "scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "matches": []
-    }
+    result = {"scraped_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "matches": []}
     
     try:
         driver.get(url)
-        try:
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "card__item-container"))
-            )
-            print("Cuotas Generales Transfermarkt: Contenido principal cargado")
-        except Exception as e:
-            print(f"Cuotas Generales Transfermarkt: Advertencia de carga de contenido: {str(e)}")
-        
-        time.sleep(3)
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located((By.CLASS_NAME, "card__item-container"))
+        )
+        print("Cuotas Generales Transfermarkt: Contenido cargado")
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         match_cards = soup.find_all('div', class_='card__item-container')
-        print(f"Encontrados {len(match_cards)} tarjetas de partidos generales en Transfermarkt")
         
         if not match_cards:
-            return {"error": "No se encontraron partidos generales en Transfermarkt. La estructura del sitio puede haber cambiado."}
-        
+            result["info"] = "No se encontraron tarjetas de partidos generales en Transfermarkt."
+            return result
+
         for card in match_cards:
             try:
-                match_name_tag = card.find('div', class_='card__bonus-name')
-                match_name = match_name_tag.text.strip() if match_name_tag else "Unknown Match"
+                match_name = safe_get_text(card.find('div', class_='card__bonus-name'), "Unknown Match")
+                league, home_team, away_team, bet_type, odd_value = "N/A", "N/A", "N/A", "N/A", "N/A"
+
+                parts = match_name.split(' - ')
+                if len(parts) >= 2:
+                    odd_value = parts[-1]
+                    main_info = ' - '.join(parts[:-1])
+                    bet_type_parts = main_info.rsplit(' - ', 1) # rsplit to get bet_type if present
+                    if len(bet_type_parts) > 1 and len(bet_type_parts[-1]) < 50: # Heuristic
+                        bet_type = bet_type_parts[-1].strip()
+                        match_info_str = bet_type_parts[0].strip()
+                    else:
+                        bet_type = "Resultado del partido" # Default
+                        match_info_str = main_info.strip()
+
+                    league_teams_parts = match_info_str.split(':', 1)
+                    if len(league_teams_parts) > 1:
+                        league = league_teams_parts[0].strip()
+                        teams_str = league_teams_parts[1].strip()
+                    else:
+                        league = "General" # Default if no league prefix
+                        teams_str = match_info_str.strip()
+                    
+                    teams = [t.strip() for t in teams_str.split('vs')]
+                    if len(teams) == 2: home_team, away_team = teams[0], teams[1]
+                    elif len(teams) == 1: home_team = teams[0]
+                else: # Fallback if parsing ' - ' fails
+                    if (num_match := re.search(r'(\d+\.\d+)$', match_name)):
+                        odd_value = num_match.group(1)
+                    # Could add more robust parsing here if needed
+                    bet_type = match_name # Use full name as bet_type if cannot parse
+
+                bookmaker_name, bookmaker_logo = "N/A", "N/A"
+                if (bookmaker_img := card.find('img', class_='card__logo')):
+                    bookmaker_name = bookmaker_img.get('alt', safe_get_text(bookmaker_img)).strip()
+                    bookmaker_logo = bookmaker_img.get('src', "N/A")
+
+                expiry_time_str = "N/A"
+                if (expiry_tag := card.find('div', class_='countdown')) and expiry_tag.has_attr('data-valid-until'):
+                     expiry_time_str = expiry_tag['data-valid-until']
                 
-                match_parts = match_name.split(' - ')
-                if len(match_parts) >= 4:
-                    league_teams = match_parts[0]
-                    bet_type = ' - '.join(match_parts[1:-1])
-                    odd_value = match_parts[-1]
-                else:
-                    league_teams = match_name
-                    bet_type = "Unknown"
-                    odd_value = "N/A"
-                
-                league = league_teams.split(':')[0].strip() if ':' in league_teams else "Unknown League"
-                teams_part = league_teams.split(':')[1].strip() if ':' in league_teams else league_teams
-                teams = [t.strip() for t in teams_part.split(' vs ')] if ' vs ' in teams_part else ["Unknown Team 1", "Unknown Team 2"]
-                
-                bookmaker_img = card.find('img')
-                bookmaker_name = bookmaker_img['alt'] if bookmaker_img and 'alt' in bookmaker_img.attrs else "Unknown Bookmaker"
-                bookmaker_logo = bookmaker_img['src'] if bookmaker_img and 'src' in bookmaker_img.attrs else "N/A"
-                
-                expiry_tag = card.find('div', class_='countdown')
-                expiry_time = expiry_tag['data-valid-until'] if expiry_tag and 'data-valid-until' in expiry_tag.attrs else "N/A"
-                
-                cleaned_odd = clean_odd_value(odd_value)
-                
-                match_data = {
-                    "league": league,
-                    "homeTeam": teams[0] if len(teams) > 0 else "Unknown",
-                    "awayTeam": teams[1] if len(teams) > 1 else "Unknown",
-                    "betType": bet_type,
-                    "odd": cleaned_odd,
-                    "bookmaker": {
-                        "name": bookmaker_name,
-                        "logo": bookmaker_logo
-                    },
-                    "expiryTime": expiry_time,
-                    "offerLink": card.find('a', class_='card__button')['href'] if card.find('a', class_='card__button') else "N/A"
-                }
-                result["matches"].append(match_data)
-            except Exception as e:
-                print(f"Error procesando tarjeta de partido general de Transfermarkt: {str(e)}")
-                print(traceback.format_exc())
-                continue
-            
+                offer_link = "N/A"
+                if (offer_link_tag := card.find('a', class_='card__button')) and offer_link_tag.has_attr('href'):
+                    offer_link = offer_link_tag['href']
+                    if offer_link.startswith('/'): offer_link = "https://www.transfermarkt.es" + offer_link
+
+                result["matches"].append({
+                    "league": league, "homeTeam": home_team, "awayTeam": away_team,
+                    "betType": bet_type, "odd": clean_odd_value(odd_value),
+                    "bookmaker": {"name": bookmaker_name, "logo": bookmaker_logo},
+                    "expiryTime": expiry_time_str, "offerLink": offer_link
+                })
+            except Exception as e_card:
+                print(f"Error procesando tarjeta general Transfermarkt: {e_card}")
     except Exception as e:
-        print(f"Error durante el scraping de cuotas generales de Transfermarkt: {str(e)}")
+        print(f"Error en scraping general Transfermarkt: {str(e)}")
         print(traceback.format_exc())
-        try:
-            driver.save_screenshot("error_screenshot_transfermarkt_general.png")
-            with open("error_page_source_transfermarkt_general.html", "w", encoding="utf-8") as f:
-                f.write(driver.page_source)
-            print("Cuotas Generales Transfermarkt: Archivos de depuración guardados")
-        except:
-            pass
-        return {"error": str(e), "stack_trace": traceback.format_exc()}
+        result["error_scraping"] = f"Error during general Transfermarkt scraping: {str(e)}"
     finally:
         if driver:
             driver.quit()
-    
+            print("Cuotas Generales Transfermarkt: WebDriver cerrado.")
+    print(f"scrape_transfermarkt_general_odds finalizado. Partidos: {len(result.get('matches',[]))}")
     return result
 
 # --- API Endpoints ---
+
+# ----- Gestión de Tareas en Segundo Plano (Conceptual - MUY RECOMENDADO PARA PRODUCCIÓN) -----
+# tasks_db = {} 
+# def run_scrape_in_background(task_id: str, scrape_function, *args):
+#     try:
+#         print(f"Background task {task_id} ({scrape_function.__name__}) started.")
+#         data = scrape_function(*args)
+#         tasks_db[task_id] = {"status": "completed", "data": data, "timestamp": datetime.now().isoformat()}
+#         print(f"Background task {task_id} completed.")
+#     except Exception as e:
+#         print(f"Background task {task_id} failed: {str(e)}")
+#         tasks_db[task_id] = {"status": "failed", "error": str(e), "trace": traceback.format_exc(), "timestamp": datetime.now().isoformat()}
+
+# @app.post("/v2/start-scraping-task/{scraper_name}")
+# async def start_background_task_v2(scraper_name: str, background_tasks: BackgroundTasks):
+#     task_id = f"{scraper_name}_{int(datetime.now().timestamp())}"
+#     tasks_db[task_id] = {"status": "pending", "task_id": task_id, "scraper_name": scraper_name, "started_at": datetime.now().isoformat()}
+#     scrape_func_map = {
+#         "liga_odds": scrape_liga_odds, "relevo_news": scrape_relevo_news, 
+#         "transfermarkt_general": scrape_transfermarkt_general_odds, "tables_liga": scrape_tablesleague_data
+#     }
+#     if scraper_name not in scrape_func_map:
+#         return JSONResponse(content={"error": "Invalid scraper name"}, status_code=400)
+#     background_tasks.add_task(run_scrape_in_background, task_id, scrape_func_map[scraper_name])
+#     return JSONResponse(content=tasks_db[task_id], status_code=202)
+
+# @app.get("/v2/scraping-task-status/{task_id}")
+# async def get_task_status_v2(task_id: str):
+#     task = tasks_db.get(task_id)
+#     if not task:
+#         return JSONResponse(content={"error": "Task not found"}, status_code=404)
+#     # Si la tarea se completó, podrías decidir devolver el status_code original del scraper si tuvo error
+#     if task.get("status") == "completed" and task.get("data", {}).get("error"):
+#         if task["data"]["error"] == "Failed to initialize browser":
+#             return JSONResponse(content=task, status_code=503)
+#         return JSONResponse(content=task, status_code=500) # O 200 con el error dentro de "data"
+#     return JSONResponse(content=task)
+# ----- Endpoints Síncronos Actuales (Propensos a Timeouts para Scrapers con Selenium) -----
+
 @app.get("/")
 def root():
     return {
         "message": "Bienvenido a la API Unificada de Scrapers",
-        "rutas_disponibles": [
-            "/raspar-cuotas-liga",
-            "/raspar-noticias-relevo",
-            "/raspar-tablas-liga",
-            "/raspar-cuotas-generales-transfermarkt"
-        ]
+        "rutas_sincronas_disponibles": [
+            "/raspar-cuotas-liga", "/raspar-noticias-relevo",
+            "/raspar-tablas-liga", "/raspar-cuotas-generales-transfermarkt"
+        ],
+        "rutas_asincronas_recomendadas (ver comentarios en código)": [
+            "POST /v2/start-scraping-task/{scraper_name}",
+            "GET /v2/scraping-task-status/{task_id}"
+        ],
+        "available_scraper_names_for_start_task": ["liga_odds", "relevo_news", "tables_liga", "transfermarkt_general"]
     }
+
+def handle_scraper_response(data, endpoint_name: str):
+    print(f"Respuesta de {endpoint_name}: {json.dumps(data, indent=2, ensure_ascii=False, default=str)}")
+    if "error" in data and data["error"] == "Failed to initialize browser":
+        return JSONResponse(content=data, status_code=503)
+    if "error_scraping" in data:
+        return JSONResponse(content=data, status_code=500)
+    if "error" in data: # Otros errores genéricos del scraper
+        return JSONResponse(content=data, status_code=500) 
+    # Si hay 'info' y no hay datos clave, es un 200 con info
+    if "info" in data and not any(k in data for k in ["matches", "articles", "leagues"]):
+        return JSONResponse(content=data, status_code=200)
+    return JSONResponse(content=data)
 
 @app.get("/raspar-cuotas-liga")
 def endpoint_raspar_cuotas_liga():
+    print("Endpoint /raspar-cuotas-liga (síncrono) llamado.")
     try:
         data = scrape_liga_odds()
-        if "error" in data:
-             return JSONResponse(content=data, status_code=500)
-        return JSONResponse(content=data)
+        return handle_scraper_response(data, "scrape_liga_odds")
     except Exception as e:
-        print("ERROR API SCRAPER (/raspar-cuotas-liga):", e)
-        print(traceback.format_exc())
-        return JSONResponse(content={"error": str(e), "stack_trace": traceback.format_exc()}, status_code=500)
+        print(f"ERROR CRÍTICO API (/raspar-cuotas-liga): {e}\n{traceback.format_exc()}")
+        return JSONResponse(content={"error": "Error interno del servidor", "details": str(e)}, status_code=500)
 
 @app.get("/raspar-noticias-relevo")
 def endpoint_raspar_noticias_relevo():
+    print("Endpoint /raspar-noticias-relevo (síncrono) llamado.")
     try:
         data = scrape_relevo_news()
-        if "error" in data:
-             return JSONResponse(content=data, status_code=500)
-        return JSONResponse(content=data)
+        return handle_scraper_response(data, "scrape_relevo_news")
     except Exception as e:
-        print("ERROR API SCRAPER (/raspar-noticias-relevo):", e)
-        print(traceback.format_exc())
-        return JSONResponse(content={"error": str(e), "stack_trace": traceback.format_exc()}, status_code=500)
+        print(f"ERROR CRÍTICO API (/raspar-noticias-relevo): {e}\n{traceback.format_exc()}")
+        return JSONResponse(content={"error": "Error interno del servidor", "details": str(e)}, status_code=500)
 
-@app.get("/raspar-tablas-liga")
+@app.get("/raspar-tablas-liga") 
 def endpoint_raspar_tablas_liga():
+    print("Endpoint /raspar-tablas-liga (síncrono) llamado.")
     try:
         data = scrape_tablesleague_data()
-        if "error" in data and "stack_trace" not in data: 
-            return JSONResponse(content=data, status_code=404 if "No se encontró" in data["error"] else 500)
-        elif "error" in data:
-            return JSONResponse(content=data, status_code=500)
+        # Este scraper no usa Selenium, así que el manejo de 'Failed to initialize browser' no aplica directamente.
+        if "error" in data: # Errores específicos de este scraper (HTTP, parsing)
+            status_code = 500
+            if "No se encontró el contenedor principal" in data["error"] or "No se encontraron cabeceras de título" in data["error"]:
+                status_code = 404 # O 503 si el sitio fuente está mal
+            elif "Fallo en la petición HTTP" in data["error"]:
+                status_code = 502 # Bad Gateway
+            return JSONResponse(content=data, status_code=status_code)
+        if "info" in data and not data.get("leagues"):
+            return JSONResponse(content=data, status_code=200) # OK, pero sin datos de ligas
         return JSONResponse(content=data)
     except Exception as e:
-        print(f"ERROR en endpoint /raspar-tablas-liga: {str(e)}")
-        print(traceback.format_exc())
-        return JSONResponse(
-            content={"error": "Error interno del servidor al procesar la solicitud.", "details": str(e)},
-            status_code=500
-        )
+        print(f"ERROR CRÍTICO API (/raspar-tablas-liga): {e}\n{traceback.format_exc()}")
+        return JSONResponse(content={"error": "Error interno del servidor", "details": str(e)}, status_code=500)
 
 @app.get("/raspar-cuotas-generales-transfermarkt")
 def endpoint_raspar_cuotas_generales_transfermarkt():
+    print("Endpoint /raspar-cuotas-generales-transfermarkt (síncrono) llamado.")
     try:
         data = scrape_transfermarkt_general_odds()
-        if "error" in data:
-             return JSONResponse(content=data, status_code=500)
-        return JSONResponse(content=data)
+        return handle_scraper_response(data, "scrape_transfermarkt_general_odds")
     except Exception as e:
-        print("ERROR API SCRAPER (/raspar-cuotas-generales-transfermarkt):", e)
-        print(traceback.format_exc())
-        return JSONResponse(content={"error": str(e), "stack_trace": traceback.format_exc()}, status_code=500)
-
+        print(f"ERROR CRÍTICO API (/raspar-cuotas-generales-transfermarkt): {e}\n{traceback.format_exc()}")
+        return JSONResponse(content={"error": "Error interno del servidor", "details": str(e)}, status_code=500)
 
 if __name__ == "__main__":
-    # Para ejecutar con FastAPI, usa: uvicorn nombre_del_archivo:app --reload
-    # Ejemplo: uvicorn scraper_unificado:app --reload
-    print("Intentando ejecutar el servidor Uvicorn...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    host_to_bind = os.environ.get("HOST", "0.0.0.0") # Para Railway y contenedores
+    reload_status = os.environ.get("UVICORN_RELOAD", "true").lower() == "true" # Controlar reload
+    
+    print(f"Intentando ejecutar Uvicorn en host {host_to_bind}, puerto {port}. Reload: {reload_status}")
+    uvicorn.run("final:app", host=host_to_bind, port=port, reload=reload_status)
